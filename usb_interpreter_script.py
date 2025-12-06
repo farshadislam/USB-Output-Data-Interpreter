@@ -1,119 +1,216 @@
-#!/usr/bin/env python3
+import serial
+import serial.tools.list_ports
 import struct
-import json
+import queue
+import threading
+import time
 import csv
+import json
+import os
+import signal
+import sys
 
-# ---------- USER SETTINGS ----------
-INPUT_FILE = "usb_log.bin"
-CSV_OUTPUT = "usb_output.csv"
-JSON_OUTPUT = "usb_output.json"
+# ==========================================================
+# CONFIG
+# ==========================================================
 
-# Standard struct size (largest of all three)
-STANDARD_SIZE = 16  # bytes (4+4+4+4 for optical sensor)
+BAUD = 115200
+TIMEOUT = 0.05
 
-# Opcodes (match your USBOpcode enum)
+# Auto-detect COM port
+def detect_port():
+    ports = serial.tools.list_ports.comports()
+    for p in ports:
+        if "USB" in p.description or "Serial" in p.description or "ACM" in p.device:
+            print(f"[✓] Detected device on {p.device}")
+            return p.device
+    raise RuntimeError("No USB serial device detected.")
+
+COM = detect_port()
+
+# Folder for output
+folder_path = os.path.join(os.getcwd(), "Data")
+os.makedirs(folder_path, exist_ok=True)
+
+# Find next available CSV file
+i = 1
+while True:
+    CSV_FILE = os.path.join(folder_path, f"usb_data{i}.csv")
+    if not os.path.exists(CSV_FILE):
+        break
+    i += 1
+
+# JSON file
+JSON_FILE = CSV_FILE.replace(".csv", ".json")
+
+# ==========================================================
+# USB Protocol Definitions
+# ==========================================================
+
+# OPCODES (must match your C enum)
 OP_OPTICAL = 0
-OP_FORCE = 1
+OP_FORCESENSOR = 1
 OP_BPM = 2
 
-# struct formats (little-endian STM32)
-FMT_OPTICAL = "<IfIf"   # timestamp, angular_velocity, raw_value, angular_accel
-FMT_FORCE   = "<IfI"    # timestamp, force, raw_value
-FMT_BPM     = "<IfI"    # timestamp, duty_cycle, raw_value
-# -----------------------------------
+# Largest struct = 16 bytes
+STANDARD_SIZE = 16   # Determined by your C++ USBController::Init()
 
+# Struct formats (little endian)
+fmt_optical = "<I f I f"      # timestamp, ang_vel, raw, ang_acc
+fmt_force   = "<I f I"        # timestamp, force, raw
+fmt_bpm     = "<I f I"        # timestamp, duty, raw
 
-def parse_record(opcode, payload):
-    """Parse a single record based on opcode and struct format."""
+# Parsed data stored for JSON export
+all_data = []
+
+# Queue for CSV writer thread
+data_queue = queue.Queue()
+
+# Thread stop flag
+running = True
+
+# ==========================================================
+# PARSER
+# ==========================================================
+
+def parse_packet(opcode, payload):
+    """
+    Parse the padded struct data based on opcode.
+    Payload is STANDARD_SIZE bytes.
+    """
 
     if opcode == OP_OPTICAL:
-        timestamp, ang_vel, raw_val, ang_acc = struct.unpack(FMT_OPTICAL, payload[:struct.calcsize(FMT_OPTICAL)])
+        ts, ang_vel, raw, ang_acc = struct.unpack(fmt_optical, payload[:struct.calcsize(fmt_optical)])
         return {
             "type": "optical_encoder",
-            "timestamp": timestamp,
+            "timestamp": ts,
             "angular_velocity": ang_vel,
-            "raw_value": raw_val,
-            "angular_acceleration": ang_acc
+            "raw_value": raw,
+            "angular_acceleration": ang_acc,
         }
 
-    elif opcode == OP_FORCE:
-        timestamp, force, raw_val = struct.unpack(FMT_FORCE, payload[:struct.calcsize(FMT_FORCE)])
+    elif opcode == OP_FORCESENSOR:
+        ts, force, raw = struct.unpack(fmt_force, payload[:struct.calcsize(fmt_force)])
         return {
             "type": "forcesensor",
-            "timestamp": timestamp,
+            "timestamp": ts,
             "force": force,
-            "raw_value": raw_val
+            "raw_value": raw,
         }
 
     elif opcode == OP_BPM:
-        timestamp, duty, raw_val = struct.unpack(FMT_BPM, payload[:struct.calcsize(FMT_BPM)])
+        ts, duty, raw = struct.unpack(fmt_bpm, payload[:struct.calcsize(fmt_bpm)])
         return {
             "type": "bpm",
-            "timestamp": timestamp,
+            "timestamp": ts,
             "duty_cycle": duty,
-            "raw_value": raw_val
+            "raw_value": raw,
         }
 
-    return None
+    else:
+        return None
 
+# ==========================================================
+# THREAD 1 — SERIAL READER
+# ==========================================================
 
+def serial_reader(port):
+    global running
 
-def parse_file():
-    records = []
+    while running:
+        try:
+            # 1 byte opcode + STANDARD_SIZE bytes payload
+            if port.in_waiting >= (1 + STANDARD_SIZE):
+                header = port.read(1)
+                payload = port.read(STANDARD_SIZE)
 
-    with open(INPUT_FILE, "rb") as f:
-        data = f.read()
+                opcode = header[0]
 
-    i = 0
-    while i < len(data):
+                parsed = parse_packet(opcode, payload)
 
-        if i + 1 > len(data):
-            break
+                if parsed:
+                    print(parsed)
+                    all_data.append(parsed)
+                    data_queue.put(parsed)
 
-        opcode = data[i]
-        i += 1
+        except Exception as e:
+            print(f"[ERROR] Serial read: {e}")
+            time.sleep(0.1)
 
-        if i + STANDARD_SIZE > len(data):
-            break
+# ==========================================================
+# THREAD 2 — CSV WRITER
+# ==========================================================
 
-        payload = data[i : i + STANDARD_SIZE]
-        i += STANDARD_SIZE
+def csv_writer():
+    global running
 
-        record = parse_record(opcode, payload)
-        if record:
-            records.append(record)
+    # Determine CSV headers
+    headers = [
+        "type",
+        "timestamp",
+        "angular_velocity",
+        "angular_acceleration",
+        "force",
+        "duty_cycle",
+        "raw_value",
+    ]
 
-    return records
-
-
-
-def write_csv(records):
-    if not records:
-        print("No records parsed.")
-        return
-
-    # Collect all possible keys
-    keys = sorted({k for r in records for k in r.keys()})
-
-    with open(CSV_OUTPUT, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=keys)
+    with open(CSV_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        for r in records:
-            writer.writerow(r)
 
+    while running:
+        while not data_queue.empty():
+            item = data_queue.get()
 
+            # Ensure all keys exist (missing fields become None)
+            row = {key: item.get(key) for key in headers}
 
-def write_json(records):
-    with open(JSON_OUTPUT, "w") as f:
-        json.dump(records, f, indent=4)
+            with open(CSV_FILE, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writerow(row)
 
+        time.sleep(0.2)
 
+# ==========================================================
+# CLEAN EXIT (Ctrl+C)
+# ==========================================================
+
+def handle_exit(sig, frame):
+    global running
+    print("\nStopping...")
+    running = False
+
+signal.signal(signal.SIGINT, handle_exit)
+
+# ==========================================================
+# MAIN
+# ==========================================================
+
+def main():
+    print(f"[✓] Opening {COM} at {BAUD} baud...")
+    port = serial.Serial(COM, BAUD, timeout=TIMEOUT)
+
+    t1 = threading.Thread(target=serial_reader, args=(port,), daemon=True)
+    t2 = threading.Thread(target=csv_writer, daemon=True)
+
+    t1.start()
+    t2.start()
+
+    print("[✓] Running... Press Ctrl+C to exit.\n")
+
+    while running:
+        time.sleep(0.5)
+
+    # Save JSON
+    print("[✓] Saving JSON...")
+    with open(JSON_FILE, "w") as f:
+        json.dump(all_data, f, indent=4)
+
+    port.close()
+    print("[✓] Done. Files saved:")
+    print(f"    CSV  → {CSV_FILE}")
+    print(f"    JSON → {JSON_FILE}")
 
 if __name__ == "__main__":
-    records = parse_file()
-    print(f"Parsed {len(records)} records.")
-
-    write_csv(records)
-    write_json(records)
-
-    print(f"Output written to:\n  - {CSV_OUTPUT}\n  - {JSON_OUTPUT}")
+    main()
